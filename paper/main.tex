@@ -5,6 +5,7 @@
 \usepackage{textcomp}
 \usepackage{xcolor}
 \usepackage{booktabs}
+\usepackage{url}
 
 \begin{document}
 
@@ -56,13 +57,13 @@ We hypothesize that replacing native optimizer row estimates with Stage-1 learne
 
 \section{Related Work}
 \subsection{Foundations of Cost-Based Query Optimization}
-Classical relational optimizers estimate operator costs by combining I/O and CPU cost constants with selectivity estimates derived from one-dimensional histograms \cite{b1}. When join predicates span correlated columns or skewed key distributions, independence assumptions produce multi-order-of-magnitude cardinality under-estimations, leading optimizers to select suboptimal nested-loop joins or inadequate memory allocations.
+Classical relational optimizers estimate operator costs by combining I/O and CPU cost constants with selectivity estimates derived from one-dimensional histograms \cite{b1, b2}. Empirical evaluations of industrial query optimizers demonstrate that cardinality estimation errors dominate plan suboptimality, particularly when join predicates span correlated columns or skewed key distributions \cite{b2}. Under such conditions, attribute-independence assumptions produce multi-order-of-magnitude under-estimations, leading optimizers to select suboptimal join operators or inadequate memory allocations.
 
 \subsection{Learning-Based Cardinality and Cost Estimation}
-Existing learning-based approaches fall into three broad categories: (i) statistical multi-column synopsis extensions, (ii) classical tree-based regressors operating on engineered plan features \cite{b4}, and (iii) deep neural architectures encoding hierarchical query plans \cite{b2, b3}. Although tree ensembles and neural networks capture non-linear operator interactions, models conditioned directly on native optimizer row counts remain vulnerable whenever upstream cardinality estimates diverge from true intermediate sizes.
+Existing learning-based approaches fall into three broad categories: (i) learned cardinality estimators modeling multi-table joint data distributions \cite{b1}, (ii) classical tree-based regressors operating on engineered plan features \cite{b3}, and (iii) deep neural architectures encoding hierarchical query plans and predicate structures \cite{b4, b5, b6}. Although tree ensembles and neural networks capture non-linear operator interactions, models conditioned directly on native optimizer row counts remain vulnerable whenever upstream cardinality estimates diverge from true intermediate sizes.
 
 \subsection{Inference Overhead and Generalization Challenges}
-Deploying learned models inside database query pipelines introduces runtime inference latency, memory overhead, and sensitivity to data drift as underlying tables evolve \cite{b3}. Evaluating models strictly on seen query templates can mask brittleness; therefore, rigorous evaluation requires held-out unseen join templates, multi-seed statistical testing, and explicit latency measurements.
+Deploying learned models inside database query pipelines introduces runtime inference latency, memory overhead, and sensitivity to data drift as underlying tables evolve \cite{b6, b7}. Evaluating models strictly on seen query templates can mask brittleness; therefore, rigorous evaluation requires held-out unseen join templates, multi-seed statistical testing, and explicit latency measurements.
 
 \section{Methodology}
 \subsection{Experimental Environment and Workloads}
@@ -74,7 +75,7 @@ A total of 510 analytical SQL queries spanning 2-join, 4-join, and 6-join comple
 Ground-truth execution plans and operator statistics were collected via \texttt{EXPLAIN (FORMAT JSON, ANALYZE, BUFFERS)}. Each JSON execution tree was traversed bottom-up from leaf scans to the root operator. For every plan node, physical operator types were one-hot encoded, structural hierarchy features (tree depth, child count, plan width, and child row aggregations) were computed, and SQL predicate structures (table count, join count, equality, range, \texttt{IN}, \texttt{LIKE}, and \texttt{GROUP BY} clauses) were parsed using SQLGlot.
 
 \subsection{Two-Stage Proposed Architecture and Baselines}
-In Stage 1, an intermediate cardinality estimator combining XGBoost \cite{b4} and a PyTorch residual multilayer perceptron was trained on $\log(y + 1)$-transformed actual row counts using L1 loss to directly minimize geometric Q-Error. In Stage 2, native PostgreSQL \texttt{Plan Rows} entries in the root feature vector were replaced with Stage-1 learned cardinality predictions ($\hat{c}_i$) to train the final execution-cost predictor.
+In Stage 1, an intermediate cardinality estimator combining XGBoost \cite{b3} and a PyTorch residual multilayer perceptron was trained on $\log(y + 1)$-transformed actual row counts using L1 loss to directly minimize geometric Q-Error. In Stage 2, native PostgreSQL \texttt{Plan Rows} entries in the root feature vector were replaced with Stage-1 learned cardinality predictions ($\hat{c}_i$) to train the final execution-cost predictor.
 
 The proposed method was evaluated against three baselines under identical experimental conditions:
 \begin{itemize}
@@ -83,7 +84,7 @@ The proposed method was evaluated against three baselines under identical experi
     \item \textbf{B3 (Single-Stage Cost Predictor):} An end-to-end XGBoost regressor predicting execution time directly from raw plan features and unadjusted PostgreSQL \texttt{Plan Rows}.
 \end{itemize}
 
-Finally, the trained pipeline was integrated into a FastAPI inference service and interactive web dashboard supporting live SQL plan inspection.
+Finally, the trained pipeline was integrated into a FastAPI inference service and interactive web dashboard supporting live SQL plan inspection. To ensure full reproducibility, the complete source code, Docker configuration, and evaluation scripts are publicly available at \url{https://github.com/alperentgccc/come381-learned-cost-estimator}.
 
 \section{Experiments and Results}
 \subsection{Evaluation Metrics and Statistical Protocol}
@@ -117,7 +118,7 @@ Table~\ref{tab:baselines} reports the multi-seed Q-Error percentiles, execution-
     \label{fig:joins}
 \end{figure}
 
-As shown in Fig.~\ref{fig:joins}, median Q-Error varied substantially across join complexities, with the proposed two-stage estimator maintaining lower median error on 2-join and 4-join queries compared to B1 and B2.
+As shown in Fig.~\ref{fig:joins}, median Q-Error varied substantially across join complexities, with the proposed two-stage estimator consistently achieving the lowest median Q-Error across all three query complexity tiers (2-join, 4-join, and 6-join), outperforming B1, B2, and B3 alike.
 
 \begin{figure}[t]
     \centering
@@ -162,9 +163,12 @@ The authors thank the Department of Computer Engineering at Do\u{g}u\c{s} Univer
 
 \begin{thebibliography}{00}
 \bibitem{b1} A. Kipf, T. Kipf, B. Radke, V. Leis, P. Boncz, and A. Kemper, ``Learned cardinalities: Estimating correlated joins with deep learning,'' in \emph{Proc. 9th Biennial Conf. Innovative Data Systems Research (CIDR)}, 2019.
-\bibitem{b2} R. Marcus and O. Papaemmanouil, ``Plan-structured deep neural network models for query performance prediction,'' \emph{Proc. VLDB Endow.}, vol. 12, no. 11, pp. 1733--1746, Jul. 2019.
-\bibitem{b3} X. Zhou, C. Chai, G. Li, and J. Sun, ``Database meets artificial intelligence: A survey,'' \emph{IEEE Trans. Knowl. Data Eng.}, vol. 34, no. 3, pp. 1096--1116, Mar. 2022.
-\bibitem{b4} T. Chen and C. Guestrin, ``XGBoost: A scalable tree boosting system,'' in \emph{Proc. 22nd ACM SIGKDD Int. Conf. Knowl. Discov. Data Min.}, 2016, pp. 785--794.
+\bibitem{b2} V. Leis, A. Gubichev, A. Mirchev, P. Boncz, A. Kemper, and T. Neumann, ``How good are query optimizers, really?'' \emph{Proc. VLDB Endow.}, vol. 9, no. 3, pp. 204--215, Nov. 2015.
+\bibitem{b3} T. Chen and C. Guestrin, ``XGBoost: A scalable tree boosting system,'' in \emph{Proc. 22nd ACM SIGKDD Int. Conf. Knowl. Discov. Data Min.}, 2016, pp. 785--794.
+\bibitem{b4} J. Sun and G. Li, ``An end-to-end learning-based cost estimator,'' \emph{Proc. VLDB Endow.}, vol. 13, no. 3, pp. 307--319, Nov. 2019.
+\bibitem{b5} R. Marcus and O. Papaemmanouil, ``Plan-structured deep neural network models for query performance prediction,'' \emph{Proc. VLDB Endow.}, vol. 12, no. 11, pp. 1733--1746, Jul. 2019.
+\bibitem{b6} X. Zhou, C. Chai, G. Li, and J. Sun, ``Database meets artificial intelligence: A survey,'' \emph{IEEE Trans. Knowl. Data Eng.}, vol. 34, no. 3, pp. 1096--1116, Mar. 2022.
+\bibitem{b7} R. Marcus, P. Negi, H. Mao, N. Tatbul, M. Alizadeh, and T. Kraska, ``Bao: Making learned query optimization practical,'' in \emph{Proc. ACM SIGMOD Int. Conf. Manage. Data}, 2021, pp. 1275--1288.
 \end{thebibliography}
 
 \end{document}
