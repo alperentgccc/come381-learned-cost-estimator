@@ -1,0 +1,42 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: come381_postgres
+    environment:
+      POSTGRES_USER: come381
+      POSTGRES_PASSWORD: come381pass
+      POSTGRES_DB: ai4db_bench
+    command: >
+      postgres
+      -c shared_buffers=256MB
+      -c work_mem=16MB
+      -c random_page_cost=1.1
+      -c max_parallel_workers_per_gather=0
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U come381 -d ai4db_bench"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    container_name: come381_ai4db_app
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://come381:come381pass@db:5432/ai4db_bench
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./results:/app/results
+      - ./models:/app/models
+
+volumes:
+  pgdata:

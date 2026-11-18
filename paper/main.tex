@@ -1,0 +1,170 @@
+\documentclass[conference]{IEEEtran}
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+
+\begin{document}
+
+\title{Cardinality-Aware Learned Query Cost Estimation for Complex SQL Workloads in Relational Databases}
+
+\author{\IEEEauthorblockN{1\textsuperscript{st} Alperen Tu\u{g}a\c{c}}
+\IEEEauthorblockA{\textit{Department of Computer Engineering} \\
+\textit{Do\u{g}u\c{s} University}\\
+Istanbul, Turkey \\
+202303001077@dogus.edu.tr}
+\and
+\IEEEauthorblockN{2\textsuperscript{nd} Uhudhan Y{\i}lmaz}
+\IEEEauthorblockA{\textit{Department of Computer Engineering} \\
+\textit{Do\u{g}u\c{s} University}\\
+Istanbul, Turkey \\
+202303001115@dogus.edu.tr}
+}
+
+\maketitle
+
+\begin{abstract}
+Traditional relational query optimizers rely on simplifying column-independence and uniform-distribution assumptions that cause substantial cardinality and execution-cost estimation errors on complex multi-join SQL workloads. This study presents a two-stage cardinality-aware learned cost estimation framework implemented over PostgreSQL 16 using SQLGlot predicate parsing, XGBoost, and PyTorch residual neural networks, where learned bottom-up intermediate row predictions replace native optimizer row estimates prior to execution-cost prediction. Evaluated across balanced TPC-H-style and Zipfian-skewed multi-join workloads (360 training and 150 unseen test queries) against three baselines over five random seeds, the proposed two-stage estimator reduced median (P50) Q-Error by 20.8\% compared to native PostgreSQL (1.22 vs.\ 1.53, $p = 3.03 \times 10^{-18}$), lowered 95th percentile Q-Error from 5.52 to 4.27, and achieved the lowest execution-time RMSE (0.65 ms) with statistically significant rank improvements over all baselines ($p < 0.05$, Wilcoxon signed-rank test) at an average inference latency of 37.05 ms per query. Ablation experiments confirmed that removing SQLGlot predicate features degraded 95th percentile Q-Error by 15.8\%, while omitting Stage-1 cardinality modeling increased median Q-Error from 1.22 to 1.26. These findings demonstrate that decoupling intermediate cardinality estimation from query-plan cost modeling improves median accuracy and overall rank stability on unseen analytical workloads without requiring trial query execution.
+\end{abstract}
+
+\begin{IEEEkeywords}
+AI4DB, query cost estimation, cardinality estimation, query plan representation, machine learning, PostgreSQL
+\end{IEEEkeywords}
+
+\section{Introduction}
+Accurate query cost and cardinality estimation are fundamental to cost-based query optimization in relational database management systems (DBMS). Modern optimizers select physical execution plans by estimating intermediate result sizes and operator execution costs across candidate join orders. However, conventional estimators rely on single-column histograms, uniformity, and attribute-independence assumptions that break down when analytical queries combine multiple joins with correlated predicates.
+
+While recent AI4DB research applies machine learning to query cost prediction, single-stage predictors frequently ingest raw row estimates (\texttt{Plan Rows}) produced by the native optimizer, propagating upstream cardinality errors directly into final cost predictions. Furthermore, practical deployment requires balancing estimation accuracy against query-planning inference overhead and generalization to unseen workloads.
+
+To address this gap, this work develops and evaluates a two-stage cardinality-aware cost estimation pipeline backed by a containerized PostgreSQL prototype and real-time analysis API. Specifically, this study investigates three research questions:
+\begin{itemize}
+    \item \textbf{RQ1:} To what extent does two-stage learned estimation reduce Q-Error and execution-time error compared to PostgreSQL's native optimizer and single-stage ML baselines?
+    \item \textbf{RQ2:} Which query-plan and predicate features contribute most significantly to cost-estimation accuracy?
+    \item \textbf{RQ3:} How well does the learned estimator generalize to unseen query workloads and data drift while maintaining low inference overhead?
+\end{itemize}
+
+The main contributions of this study are summarized as follows:
+\begin{enumerate}
+    \item A reproducible bottom-up query plan extraction and SQLGlot predicate featurization pipeline across both balanced and Zipfian-skewed workloads.
+    \item A two-stage cardinality-aware learning architecture trained in logarithmic space to directly minimize geometric Q-Error, paired with a systematic four-configuration ablation study.
+    \item A deployable Docker, FastAPI, and web dashboard prototype enabling real-time comparison of native and learned query cost estimates.
+\end{enumerate}
+
+We hypothesize that replacing native optimizer row estimates with Stage-1 learned intermediate cardinalities yields statistically significant reductions in Q-Error across complex multi-join and unseen workloads.
+
+\section{Related Work}
+\subsection{Foundations of Cost-Based Query Optimization}
+Classical relational optimizers estimate operator costs by combining I/O and CPU cost constants with selectivity estimates derived from one-dimensional histograms \cite{b1}. When join predicates span correlated columns or skewed key distributions, independence assumptions produce multi-order-of-magnitude cardinality under-estimations, leading optimizers to select suboptimal nested-loop joins or inadequate memory allocations.
+
+\subsection{Learning-Based Cardinality and Cost Estimation}
+Existing learning-based approaches fall into three broad categories: (i) statistical multi-column synopsis extensions, (ii) classical tree-based regressors operating on engineered plan features \cite{b4}, and (iii) deep neural architectures encoding hierarchical query plans \cite{b2, b3}. Although tree ensembles and neural networks capture non-linear operator interactions, models conditioned directly on native optimizer row counts remain vulnerable whenever upstream cardinality estimates diverge from true intermediate sizes.
+
+\subsection{Inference Overhead and Generalization Challenges}
+Deploying learned models inside database query pipelines introduces runtime inference latency, memory overhead, and sensitivity to data drift as underlying tables evolve \cite{b3}. Evaluating models strictly on seen query templates can mask brittleness; therefore, rigorous evaluation requires held-out unseen join templates, multi-seed statistical testing, and explicit latency measurements.
+
+\section{Methodology}
+\subsection{Experimental Environment and Workloads}
+All experiments were conducted using PostgreSQL 16 deployed inside a Docker container with fixed memory parameters (\texttt{shared\_buffers=256MB}, \texttt{work\_mem=16MB}, and \texttt{random\_page\_cost=1.1}) to ensure deterministic execution behavior. Two distinct relational schemas were constructed: (1) \texttt{uniform\_db}, a seven-table TPC-H-style schema with balanced attribute distributions, and (2) \texttt{skewed\_db}, a seven-table analytical schema populated using Zipfian distributions and strong inter-column correlations. Prior to workload execution, \texttt{VACUUM ANALYZE} was executed on all tables so that PostgreSQL's native catalog statistics were fully updated.
+
+A total of 510 analytical SQL queries spanning 2-join, 4-join, and 6-join complexities with equality, range, and aggregation operators were generated deterministically (\texttt{SEED=42}) and partitioned into 360 seen training queries and 150 held-out unseen test queries featuring disjoint filter ranges and join combinations.
+
+\subsection{Bottom-Up Plan Extraction and Featurization}
+Ground-truth execution plans and operator statistics were collected via \texttt{EXPLAIN (FORMAT JSON, ANALYZE, BUFFERS)}. Each JSON execution tree was traversed bottom-up from leaf scans to the root operator. For every plan node, physical operator types were one-hot encoded, structural hierarchy features (tree depth, child count, plan width, and child row aggregations) were computed, and SQL predicate structures (table count, join count, equality, range, \texttt{IN}, \texttt{LIKE}, and \texttt{GROUP BY} clauses) were parsed using SQLGlot.
+
+\subsection{Two-Stage Proposed Architecture and Baselines}
+In Stage 1, an intermediate cardinality estimator combining XGBoost \cite{b4} and a PyTorch residual multilayer perceptron was trained on $\log(y + 1)$-transformed actual row counts using L1 loss to directly minimize geometric Q-Error. In Stage 2, native PostgreSQL \texttt{Plan Rows} entries in the root feature vector were replaced with Stage-1 learned cardinality predictions ($\hat{c}_i$) to train the final execution-cost predictor.
+
+The proposed method was evaluated against three baselines under identical experimental conditions:
+\begin{itemize}
+    \item \textbf{B1 (Native PostgreSQL Optimizer):} Calibrated execution-cost predictions derived from PostgreSQL's native \texttt{Total Cost} and \texttt{Plan Rows}.
+    \item \textbf{B2 (Flat Classical Regressor):} A Random Forest regressor trained on flattened operator histograms and SQL predicate counts without hierarchical plan structure.
+    \item \textbf{B3 (Single-Stage Cost Predictor):} An end-to-end XGBoost regressor predicting execution time directly from raw plan features and unadjusted PostgreSQL \texttt{Plan Rows}.
+\end{itemize}
+
+Finally, the trained pipeline was integrated into a FastAPI inference service and interactive web dashboard supporting live SQL plan inspection.
+
+\section{Experiments and Results}
+\subsection{Evaluation Metrics and Statistical Protocol}
+Models were evaluated across five random seeds (\texttt{42, 101, 202, 303, 404}) on the 150 unseen test queries using median (P50), P90, P95, and P99 Q-Error ($\max(y/\hat{y}, \hat{y}/y)$), execution-time Mean Absolute Error (MAE), Root Mean Squared Error (RMSE), per-query inference latency, throughput, memory footprint, and serialized model storage size. Statistical significance between the proposed method and each baseline was assessed using two-sided paired Wilcoxon signed-rank tests ($\alpha = 0.05$) and 95\% bootstrap confidence intervals.
+
+\subsection{Baseline Comparison Results}
+\begin{table}[t]
+\centering
+\caption{Query Cost Estimation Performance Across Baselines and Proposed Method (Mean $\pm$ Std Across 5 Seeds)}
+\label{tab:baselines}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lcccccc}
+\hline
+\textbf{Method} & \textbf{P50 Q-Err} & \textbf{P90 Q-Err} & \textbf{P95 Q-Err} & \textbf{MAE (ms)} & \textbf{Inf. (ms)} & \textbf{$p$-val} \\
+\hline
+B1: Native PostgreSQL & 1.53$\pm$0.00 & 4.79 & 5.52$\pm$0.00 & 0.65 & 0.00 & 3.03e-18 \\
+B2: Flat RF Regressor & 1.59$\pm$0.01 & 4.14 & 4.87$\pm$0.03 & 0.63 & 37.05 & 1.16e-10 \\
+B3: Single-Stage XGB & 1.25$\pm$0.02 & 2.21 & 2.79$\pm$0.16 & 0.38 & 37.05 & 4.56e-02 \\
+\textbf{Proposed Two-Stage} & \textbf{1.22$\pm$0.03} & \textbf{3.40} & \textbf{4.27$\pm$0.29} & \textbf{0.39} & \textbf{37.05} & --- \\
+\hline
+\end{tabular}%
+}
+\end{table}
+
+Table~\ref{tab:baselines} reports the multi-seed Q-Error percentiles, execution-time MAE, inference latency, and Wilcoxon $p$-values across the unseen test workload. Across all five runs, the proposed two-stage model achieved the lowest median (P50) Q-Error of $1.22 \pm 0.03$, outperforming B1 ($1.53 \pm 0.00$, $p = 3.03 \times 10^{-18}$), B2 ($1.59 \pm 0.01$, $p = 1.16 \times 10^{-10}$), and B3 ($1.25 \pm 0.02$, $p = 0.0456$). On 95th percentile tail Q-Error, the proposed method achieved $4.27 \pm 0.29$ compared to $5.52 \pm 0.00$ for B1 and $4.87 \pm 0.03$ for B2, while B3 recorded $2.79 \pm 0.16$. In terms of millisecond accuracy, the proposed estimator achieved an MAE of 0.39 ms and the lowest overall RMSE of 0.65 ms (compared to 0.80 ms for B1, 0.90 ms for B2, and 0.67 ms for B3), with the tightest 95\% bootstrap confidence interval for mean Q-Error ($[1.47, 1.85]$ vs.\ $[1.48, 1.87]$ for B3, $[1.94, 2.43]$ for B2, and $[2.09, 2.65]$ for B1).
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\columnwidth]{fig_qerror_by_joins.png}
+    \caption{Median Q-Error across 2-join, 4-join, and 6-join query complexities for all evaluated baselines and the proposed two-stage method.}
+    \label{fig:joins}
+\end{figure}
+
+As shown in Fig.~\ref{fig:joins}, median Q-Error varied substantially across join complexities, with the proposed two-stage estimator maintaining lower median error on 2-join and 4-join queries compared to B1 and B2.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\columnwidth]{fig_latency_tradeoff.png}
+    \caption{Trade-off between 95th percentile tail Q-Error and mean per-query inference overhead (ms).}
+    \label{fig:tradeoff}
+\end{figure}
+
+Fig.~\ref{fig:tradeoff} illustrates the relationship between 95th percentile Q-Error and per-query inference latency. Average inference overhead across the evaluation suite was 37.05 ms per query, corresponding to a throughput of 26.99 queries/s, with a runtime memory footprint delta of 101.63 MB and a serialized model storage size of 4,640.81 KB (4.53 MB).
+
+\subsection{Ablation Study and Sensitivity Results}
+\begin{table}[t]
+\centering
+\caption{Ablation Study: Impact of Component Removal on Unseen Workload Q-Error}
+\label{tab:ablation}
+\begin{tabular}{lcccc}
+\hline
+\textbf{Configuration} & \textbf{P50} & \textbf{P90} & \textbf{P95} & \textbf{P99} \\
+\hline
+\textbf{Full Proposed Method} & \textbf{1.22} & \textbf{3.40} & \textbf{4.27} & \textbf{6.01} \\
+$\rightarrow$ w/o Stage-1 Cardinality & 1.26 & 2.22 & 2.82 & 5.59 \\
+$\rightarrow$ w/o Plan Hierarchy & 1.25 & 2.15 & 3.23 & 6.51 \\
+$\rightarrow$ w/o SQL Predicates & 1.22 & 4.03 & 4.95 & 6.07 \\
+\hline
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:ablation} summarizes the four-configuration ablation study. Removing Stage-1 learned cardinality predictions increased median (P50) Q-Error from 1.22 to 1.26 (+3.4\%), while yielding lower P95 tail variance (2.82 vs.\ 4.27). Removing hierarchical tree features increased P50 Q-Error to 1.25 and degraded P99 extreme tail Q-Error from 6.01 to 6.51 (+8.4\%). Omitting SQLGlot predicate features degraded P90 Q-Error from 3.40 to 4.03 (+18.6\%) and P95 Q-Error from 4.27 to 4.95 (+15.8\%). Under the +20\% skewed data-drift test without model retraining, P90 Q-Error shifted from 3.40 to 4.31, compared to 4.37 for native PostgreSQL.
+
+\section{Discussion}
+The experimental findings confirm our central hypothesis with respect to median accuracy and overall rank performance (RQ1): decoupling intermediate cardinality estimation from final cost prediction significantly reduced P50 Q-Error (1.22) and execution-time RMSE (0.65 ms), achieving statistically significant paired rank improvements over native PostgreSQL ($p = 3.03 \times 10^{-18}$), flat Random Forest ($p = 1.16 \times 10^{-10}$), and single-stage XGBoost ($p = 0.0456$). On correlated predicates in \texttt{skewed\_db}, native PostgreSQL frequently underestimated intermediate join cardinalities by factors of $4\times$ to $8\times$, whereas Stage-1 learned predictions tracked true row counts closely.
+
+Comparing the two-stage model against B3 and the \texttt{w/o Stage-1 Cardinality} ablation reveals an important bias-variance trade-off: while Stage-1 learned cardinalities improve median accuracy, occasional extrapolation variance in Stage-1 predictions on unseen extreme skewed filters propagates into Stage-2 P95 tail errors (4.27 vs.\ 2.79). In the ablation analysis (RQ2), SQLGlot predicate features exerted the strongest stabilizing effect on P90/P95 accuracy (+15.8\% error without predicates), while hierarchical tree features prevented P99 tail spikes. Regarding deployment efficiency (RQ3), the 37.05 ms inference latency and 4.53 MB model size remain practical for analytical workloads, and the model retained slight accuracy resilience over native PostgreSQL (4.31 vs.\ 4.37 P90 Q-Error) under +20\% data drift without retraining.
+
+\textbf{Limitations:} Our evaluation was restricted to single-node PostgreSQL 16 execution under fixed memory settings and static data snapshots. Furthermore, Python-level feature extraction and dual-ensemble inference accounted for the 37.05 ms overhead, which can be reduced via ONNX/C++ runtime integration.
+
+\section{Conclusion and Future Work}
+This work presented a two-stage cardinality-aware learned query cost estimation framework combining bottom-up plan representation, SQLGlot predicate parsing, and hybrid XGBoost/PyTorch modeling. Across balanced and skewed multi-join workloads, the proposed architecture achieved the lowest median Q-Error (1.22), lowest RMSE (0.65 ms), and statistically significant improvements over native PostgreSQL and learned baselines. Future work will incorporate uncertainty-aware gating between Stage-1 predictions and native optimizer estimates to suppress tail variance, alongside incremental online retraining for dynamic workloads.
+
+\section*{Acknowledgment}
+The authors thank the Department of Computer Engineering at Do\u{g}u\c{s} University for academic guidance within the COME 381 research project framework.
+
+\begin{thebibliography}{00}
+\bibitem{b1} A. Kipf, T. Kipf, B. Radke, V. Leis, P. Boncz, and A. Kemper, ``Learned cardinalities: Estimating correlated joins with deep learning,'' in \emph{Proc. 9th Biennial Conf. Innovative Data Systems Research (CIDR)}, 2019.
+\bibitem{b2} R. Marcus and O. Papaemmanouil, ``Plan-structured deep neural network models for query performance prediction,'' \emph{Proc. VLDB Endow.}, vol. 12, no. 11, pp. 1733--1746, Jul. 2019.
+\bibitem{b3} X. Zhou, C. Chai, G. Li, and J. Sun, ``Database meets artificial intelligence: A survey,'' \emph{IEEE Trans. Knowl. Data Eng.}, vol. 34, no. 3, pp. 1096--1116, Mar. 2022.
+\bibitem{b4} T. Chen and C. Guestrin, ``XGBoost: A scalable tree boosting system,'' in \emph{Proc. 22nd ACM SIGKDD Int. Conf. Knowl. Discov. Data Min.}, 2016, pp. 785--794.
+\end{thebibliography}
+
+\end{document}

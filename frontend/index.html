@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>COME 381 AI4DB — Learned Query Cost & Cardinality Estimator</title>
+  <style>
+    :root { --bg: #0f172a; --card: #1e293b; --border: #334155; --text: #f1f5f9; --muted: #94a3b8; --accent: #38bdf8; --green: #22c55e; --amber: #f59e0b; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 24px; }
+    .container { max-width: 1180px; margin: 0 auto; }
+    h1 { font-size: 1.6rem; margin-bottom: 4px; color: var(--accent); }
+    p.sub { color: var(--muted); margin-top: 0; margin-bottom: 20px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-bottom: 20px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+    .metric-label { font-size: 0.78rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+    .metric-val { font-size: 1.5rem; font-weight: 700; margin-top: 6px; }
+    textarea { width: 100%; height: 120px; background: #0b1120; color: #e2e8f0; border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-family: monospace; font-size: 0.9rem; box-sizing: border-box; }
+    .btn-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; align-items: center; }
+    button { background: var(--accent); color: #0f172a; border: none; padding: 10px 16px; border-radius: 7px; font-weight: 600; cursor: pointer; }
+    button.secondary { background: #334155; color: var(--text); }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 0.88rem; }
+    th, td { text-align: left; padding: 10px; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 600; }
+    .badge { padding: 3px 8px; border-radius: 5px; font-size: 0.78rem; font-weight: 600; background: rgba(56,189,248,0.15); color: var(--accent); }
+    .err { color: #f87171; margin-top: 10px; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>Cardinality-Aware Learned Query Cost Estimator (COME 381)</h1>
+  <p class="sub">Interactive AI4DB Prototype — Live PostgreSQL Plan Tree Inspection, Baseline Comparison & Statistical Benchmark</p>
+
+  <div class="card" style="margin-bottom: 20px;">
+    <div class="metric-label" style="margin-bottom: 8px;">SQL Query Analyzer</div>
+    <textarea id="sqlInput" placeholder="Enter a SELECT query over uniform_db or skewed_db..."></textarea>
+    <div class="btn-row">
+      <button onclick="runAnalysis()">Analyze & Predict Cost</button>
+      <button class="secondary" onclick="loadSample(0)">Load Skewed 4-Join Sample</button>
+      <button class="secondary" onclick="loadSample(1)">Load Uniform 6-Join Sample</button>
+      <label style="font-size: 0.85rem; color: var(--muted);">
+        <input type="checkbox" id="execActual" checked /> Execute EXPLAIN ANALYZE (Ground Truth)
+      </label>
+    </div>
+    <div id="errorBox" class="err"></div>
+  </div>
+
+  <div id="liveResults" style="display:none;">
+    <div class="grid">
+      <div class="card">
+        <div class="metric-label">Actual Execution Time</div>
+        <div class="metric-val" id="valActual" style="color: var(--green);">—</div>
+      </div>
+      <div class="card">
+        <div class="metric-label">Proposed Two-Stage Est.</div>
+        <div class="metric-val" id="valProp" style="color: var(--accent);">—</div>
+      </div>
+      <div class="card">
+        <div class="metric-label">B1: Native PostgreSQL Est.</div>
+        <div class="metric-val" id="valB1" style="color: var(--amber);">—</div>
+      </div>
+      <div class="card">
+        <div class="metric-label">B3: Single-Stage XGB Est.</div>
+        <div class="metric-val" id="valB3">—</div>
+      </div>
+      <div class="card">
+        <div class="metric-label">Model Inference Overhead</div>
+        <div class="metric-val" id="valInf">—</div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom: 20px;">
+      <div class="metric-label">Bottom-Up Plan Tree Node Cardinality Breakdown</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Depth</th>
+            <th>Operator Node</th>
+            <th>PG Native Plan Rows</th>
+            <th>Stage-1 Learned Cardinality</th>
+            <th>Actual Rows (Ground Truth)</th>
+          </tr>
+        </thead>
+        <tbody id="nodeTableBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card" id="benchCard" style="display:none;">
+    <div class="metric-label">Multi-Seed Experimental Benchmark Summary (Unseen Workloads)</div>
+    <table>
+      <thead>
+        <tr>
+          <th>Method</th>
+          <th>P50 Q-Error</th>
+          <th>P90 Q-Error</th>
+          <th>P95 Q-Error</th>
+          <th>MAE (ms)</th>
+          <th>Inference (ms)</th>
+          <th>Wilcoxon p-value</th>
+        </tr>
+      </thead>
+      <tbody id="benchTableBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  let samples = [];
+  async function init() {
+    const res = await fetch('/api/sample-queries');
+    const data = await res.json();
+    samples = data.samples || [];
+    if (samples.length > 0) document.getElementById('sqlInput').value = samples[0].sql;
+
+    const bRes = await fetch('/api/benchmark-results');
+    const bData = await bRes.json();
+    if (bData.available) {
+      document.getElementById('benchCard').style.display = 'block';
+      const tbody = document.getElementById('benchTableBody');
+      const names = {
+        B1_NativePG: 'B1: Native PostgreSQL Optimizer',
+        B2_FlatRF: 'B2: Flat-Feature RF Regressor',
+        B3_SingleStage: 'B3: Single-Stage XGBoost',
+        Proposed_TwoStage: 'Proposed Two-Stage Cardinality-Aware'
+      };
+      for (const [k, label] of Object.entries(names)) {
+        const d = bData.summary_table[k];
+        const pval = k === 'Proposed_TwoStage' ? 'Reference' : d.wilcoxon_p.toExponential(2);
+        tbody.innerHTML += `<tr>
+          <td><strong>${label}</strong></td>
+          <td>${d.p50_mean.toFixed(2)} ± ${d.p50_std.toFixed(2)}</td>
+          <td>${d.p90_mean.toFixed(2)}</td>
+          <td>${d.p95_mean.toFixed(2)} ± ${d.p95_std.toFixed(2)}</td>
+          <td>${d.mae_ms_mean.toFixed(2)} ms</td>
+          <td>${d.inference_latency_ms.toFixed(2)} ms</td>
+          <td><span class="badge">${pval}</span></td>
+        </tr>`;
+      }
+    }
+  }
+
+  function loadSample(idx) {
+    if (samples[idx]) document.getElementById('sqlInput').value = samples[idx].sql;
+  }
+
+  async function runAnalysis() {
+    document.getElementById('errorBox').innerText = '';
+    const sql = document.getElementById('sqlInput').value;
+    const execute_actual = document.getElementById('execActual').checked;
+    const res = await fetch('/api/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sql, execute_actual })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      document.getElementById('errorBox').innerText = data.detail || 'Error analyzing query';
+      return;
+    }
+    document.getElementById('liveResults').style.display = 'block';
+    document.getElementById('valActual').innerText = data.actual_execution_time_ms !== null ? data.actual_execution_time_ms + ' ms' : 'Not Executed';
+    document.getElementById('valProp').innerText = data.predictions.proposed_two_stage.pred_time_ms + ' ms';
+    document.getElementById('valB1').innerText = data.predictions.b1_native_pg.pred_time_ms + ' ms';
+    document.getElementById('valB3').innerText = data.predictions.b3_single_stage.pred_time_ms + ' ms';
+    document.getElementById('valInf').innerText = data.model_inference_ms + ' ms';
+
+    const tbody = document.getElementById('nodeTableBody');
+    tbody.innerHTML = '';
+    for (const n of data.predictions.node_breakdown) {
+      tbody.innerHTML += `<tr>
+        <td>${n.depth}</td>
+        <td><strong>${n.node_type}</strong></td>
+        <td>${n.pg_plan_rows}</td>
+        <td style="color: var(--accent); font-weight:600;">${n.learned_card}</td>
+        <td>${n.actual_rows}</td>
+      </tr>`;
+    }
+  }
+  init();
+</script>
+</body>
+</html>
